@@ -1,10 +1,13 @@
-from theano import tensor as T
+    from theano import tensor as T
 
 import theano
 from theano.gradient import np
 from theano.tensor.nnet import sigmoid
 
 floatX = "float32"
+
+
+# Code inspired from: https://github.com/kyunghyuncho/dl4mt-material
 
 
 def slice(tensor, idx, dim):
@@ -101,22 +104,27 @@ def compute_episodes(attentions, facts, questions, Wf, Uf, bf, dim, mask=None):
     return episodes
 
 
-def get_episodic_memory(facts, questions, nb_passes):
+def get_episodic_memory(facts, questions, nb_passes, params):
 
-    def compute_memory(f, q, m_1, U, W_1, b_1, W_2, b_2, W_b, Wf, Uf, bf, Wm,
-                       Bm, dim):
+    def compute_memory(f, q, m_1, U, W1, b1, W2, b2, Wb, Wf, Uf, bf, Wm,
+                       bm, dim):
         # 1. Compute the attention from the fact, memory and question
-        a = compute_attention(f, q, m_1, W_1, b_1, W_2, b_2, W_b)
+        a = compute_attention(f, q, m_1, W1, b1, W2, b2, Wb)
         # 2. Compute the episode from the attention and the facts
         e = compute_episodes(a, f, q, Wf, Uf, bf, dim)
         # 3. Compute the new memory from the episode
-        e_dot_Wm_plus_bm = T.dot(e, Wm) + Bm
+        e_dot_Wm_plus_bm = T.dot(e, Wm) + bm
         m = compute_gru_state(e_dot_Wm_plus_bm, m_1, U, dim)
         return m
 
+    m_1 = T.matrix('memory', dtype=floatX)
+
     seqs = [facts]
     init_states = [T.alloc(questions)]  # Initialize it to the question
-    non_seqs = [questions]
+    non_seqs = [questions, m_1]
+    params_keys  = ['U', 'W1', 'b1', 'W2', 'b2', 'Wb', 'Wf', 'Uf', 'bf', 'Wm',
+                    'bm', 'dim']
+    non_seqs = non_seqs + [params[k] for k in params_keys]
 
     memories, updates = theano.scan(compute_memory,
                                     sequences=seqs,
@@ -178,6 +186,23 @@ def gru_layer(x, W, U, b, init_states=None, mask=None):
     return [states]
 
 
+def init_params():
+    params = dict()
+    params['U'] = T.matrix('U', floatX)
+    params['W1'] = T.matrix('W1', floatX)
+    params['b1'] = T.vector('b1', floatX)
+    params['W2'] = T.matrix('W2', floatX)
+    params['b2'] = T.vector('b2', floatX)
+    params['Wb'] = T.matrix('Wb', floatX)
+    params['Wf'] = T.matrix('Wf', floatX)
+    params['Uf'] = T.matrix('Uf', floatX)
+    params['bf'] = T.vector('bf', floatX)
+    params['Wm'] = T.matrix('Wm', floatX)
+    params['bm'] = T.vector('bm', floatX)
+    params['dim'] = T.vector('dim', floatX)
+    return params
+
+
 def compute_episodic_memory():
     batch_size = 10
     fact_length = 15
@@ -190,13 +215,17 @@ def compute_episodic_memory():
     facts = T.tensor3(dtype=floatX)
     questions = T.tensor3(dtype=floatX)
 
-    episodic_memories = get_episodic_memory(facts, questions, nb_passes)
+    params = init_params(representation_dim)
+
+    episodic_memories = get_episodic_memory(facts, questions, nb_passes,
+                                            params)
 
     fn = theano.function([facts, questions], [episodic_memories])
 
-    f = np.random.normal(size=(batch_size, fact_length, representation_dim))
+    f = np.random.normal(
+        size=(batch_size, fact_length, representation_dim)).astype(floatX)
     q = np.random.normal(
-        size=(batch_size, question_length, representation_dim))
+        size=(batch_size, question_length, representation_dim)).astype(floatX)
 
     m = fn([f, q])
 

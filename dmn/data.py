@@ -3,7 +3,7 @@
 def prepare_data(seqs_x, seqs_y, maxlen=None,
                  n_words_src=30000, n_words=30000):
 
-    # x: a list of sentences
+        # x: a list of sentences
     lengths_x = [len(s) for s in seqs_x]
     lengths_y = [len(s) for s in seqs_y]
 
