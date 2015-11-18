@@ -28,10 +28,13 @@ def test_inner_gru_step(layer, input_n, hid_previous, attention_gate,
 def test_masked_inner_gru_step(layer, input_n, mask_n, hid_previous,
                                attention_gate, W_hid_stacked, W_in_stacked,
                                b_stacked):
-    hidden_n_1 = layer.inner_gru_step(input_n, hid_previous, attention_gate)
+    hidden_n_1 = layer.masked_inner_gru_step(input_n, mask_n, hid_previous,
+                                             attention_gate, W_hid_stacked,
+                                             W_in_stacked, b_stacked)
     inputs = [input_n, mask_n, hid_previous, attention_gate, W_hid_stacked,
               W_in_stacked, b_stacked]
-    fn = theano.function(inputs, [hidden_n_1], mode='DebugMode')
+    fn = theano.function(inputs, hidden_n_1, mode='DebugMode',
+                         on_unused_input='ignore')
     return fn
 
 
@@ -50,23 +53,30 @@ if __name__ == '__main__':
 
     fact = T.matrix("fact", dtype=floatX)
     facts = T.tensor3("facts", dtype=floatX)
+    masks = T.matrix("masks", dtype=intX)
     question = T.matrix(name="question", dtype=floatX)
     memory = T.matrix("memory", dtype=floatX)
     gate = T.matrix("gate", dtype=floatX)
     mask = T.vector("mask", dtype=intX)
+    shuffled_broadcastable_mask = mask.dimshuffle(0, 'x')
     W_hid = T.matrix("W_hid", dtype=floatX)
     W_in = T.matrix("W_in", dtype=floatX)
     b = T.vector("b", dtype=floatX)
 
     l_in = InputLayer(shape=(batch_size, fact_length, representation_dim),
                       input_var=facts)
+    l_mask = InputLayer(shape=(batch_size, fact_length),
+                        input_var=masks)
     layer = EpisodicMemoryLayer(l_in, representation_dim, n_decodesteps)
+    layer_masked = EpisodicMemoryLayer(l_in, representation_dim, n_decodesteps,
+                                       mask_input=l_mask)
 
     input_n = np.random.normal(
         size=(batch_size, 3 * representation_dim)).astype(
         floatX)
     mask_n = np.random.binomial(n=1, p=.8,
-                                size=(batch_size, fact_length)).astype(intX)
+                                size=(batch_size,)).astype(intX)
+    shuffled_broadcastable_mask_n = mask_n.reshape((mask_n.shape[0], 1))
     hid_previous = np.random.normal(
         size=(batch_size, representation_dim)).astype(floatX)
     attention_gate = np.random.normal(
@@ -84,11 +94,20 @@ if __name__ == '__main__':
     # print gates[0].shape
 
     # Test the modified GRU
-    # Compute the gates
-    get_episode = test_inner_gru_step(layer, fact, memory, gate, W_hid, W_in,
-                                      b)
-    episode = get_episode(input_n, hid_previous, attention_gate, W_hid_stacked,
-                          W_in_stacked, b_stacked)
-    print episode
-    print episode.shape
+    # get_episode = test_inner_gru_step(layer, fact, memory, gate, W_hid, W_in,
+    #                                   b)
+    # episode = get_episode(input_n, hid_previous, attention_gate, W_hid_stacked,
+    #                       W_in_stacked, b_stacked)
+    # print episode
+    # print episode.shape
+
+    # Test the modified GRU with a mask
+    get_episode_with_mask = test_masked_inner_gru_step(layer, fact, shuffled_broadcastable_mask,
+                                                       memory, gate, W_hid,
+                                                       W_in, b)
+    masked_episode = get_episode_with_mask(input_n, shuffled_broadcastable_mask_n, hid_previous,
+                                           attention_gate, W_hid_stacked,
+                                           W_in_stacked, b_stacked)
+    print masked_episode
+    print masked_episode.shape
     # test_masked_inner_gru_step(layer, first_fact, mask, question, memory)

@@ -399,6 +399,7 @@ class EpisodicMemoryLayer(MergeLayer):
                                   W_hid_stacked, W_in_stacked, b_stacked)
         # Skip over any input with mask 0 by copying the previous
         # hidden state; proceed normally for any input with mask 1.
+        # return hid
         not_mask = 1 - mask_n
         hid = hid * mask_n + hid_previous * not_mask
         return hid
