@@ -4,6 +4,8 @@ import theano.tensor as T
 from lasagne.layers import InputLayer
 
 from dmn.episodic_memory import EpisodicMemoryLayer
+
+
 # theano.config.exception_verbosity = 'high'
 
 def gating_function(layer, fact, memory, question, representation_dim):
@@ -134,9 +136,11 @@ if __name__ == '__main__':
     # print masked_inner_gru_state.shape
 
     # Test
-    episodes = layer.get_output_for([facts])
-    fn = theano.function([facts], episodes)
+    episodic_mem = layer.get_output_for([facts])
+    fn = theano.function([facts], episodic_mem, #mode='DebugMode',
+                         on_unused_input='ignore'
+                         )
 
-    np_episodes = fn(np_facts)
-    print np_episodes
-    print np_episodes.shape
+    np_episodic_mem = fn(np_facts)
+    print np_episodic_mem
+    print np_episodic_mem.shape
