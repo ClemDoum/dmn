@@ -4,7 +4,7 @@ import theano.tensor as T
 from lasagne.layers import InputLayer
 
 from dmn.episodic_memory import EpisodicMemoryLayer
-
+# theano.config.exception_verbosity = 'high'
 
 def gating_function(layer, fact, memory, question, representation_dim):
     incoming = [fact, question, memory]
@@ -38,6 +38,21 @@ def test_masked_inner_gru_step(layer, input_n, mask_n, hid_previous,
     return fn
 
 
+def test_gru_episode(layer, inputs, gates, initial_episode, W_hid_stacked,
+                     W_in_stacked, b_stacked):
+    ep = layer.episode(inputs, gates, initial_episode, W_hid_stacked,
+                       W_in_stacked, b_stacked, mask=None)
+
+    ins = [inputs, gates, initial_episode, W_hid_stacked, W_in_stacked,
+           b_stacked]
+    fn = theano.function(ins, ep, mode='DebugMode', on_unused_input='ignore')
+    return fn
+
+
+def test_masked_gru_episode():
+    pass
+
+
 if __name__ == '__main__':
     floatX = "float32"
     intX = "int32"
@@ -46,7 +61,7 @@ if __name__ == '__main__':
     fact_length = 3
     question_length = 7
 
-    representation_dim = 40
+    representation_dim = 38
 
     n_decodesteps = 100
     # nb_passes = 3
@@ -71,6 +86,11 @@ if __name__ == '__main__':
     layer_masked = EpisodicMemoryLayer(l_in, representation_dim, n_decodesteps,
                                        mask_input=l_mask)
 
+    np_facts = np.random.normal(
+        size=(batch_size, fact_length, representation_dim)).astype(floatX)
+    inputs = np.random.normal(
+        size=(batch_size, fact_length, 3 * representation_dim)).astype(
+        floatX)
     input_n = np.random.normal(
         size=(batch_size, 3 * representation_dim)).astype(
         floatX)
@@ -79,8 +99,7 @@ if __name__ == '__main__':
     shuffled_broadcastable_mask_n = mask_n.reshape((mask_n.shape[0], 1))
     hid_previous = np.random.normal(
         size=(batch_size, representation_dim)).astype(floatX)
-    attention_gate = np.random.normal(
-        size=(batch_size, representation_dim)).astype(floatX)
+
     W_hid_stacked = np.random.normal(
         size=(representation_dim, 3 * representation_dim)).astype(floatX)
     W_in_stacked = np.random.normal(
@@ -93,21 +112,31 @@ if __name__ == '__main__':
     # print gates
     # print gates[0].shape
 
-    # Test the modified GRU
-    # get_episode = test_inner_gru_step(layer, fact, memory, gate, W_hid, W_in,
-    #                                   b)
-    # episode = get_episode(input_n, hid_previous, attention_gate, W_hid_stacked,
-    #                       W_in_stacked, b_stacked)
-    # print episode
-    # print episode.shape
+    # # Test the modified GRU
+    # get_inner_gru_state = test_inner_gru_step(
+    #     layer, fact, memory, gate, W_hid, W_in, b)
+    # inner_gru_states = get_inner_gru_state(
+    #     input_n, hid_previous, attention_gate, W_hid_stacked, W_in_stacked,
+    #     b_stacked)
+    # print inner_gru_states
+    # print inner_gru_states.shape
+    #
+    # # Test the modified GRU with a mask
+    #
+    # get_inner_gru_state_with_mask = test_masked_inner_gru_step(
+    #
+    #     layer, fact, shuffled_broadcastable_mask, memory, gate, W_hid, W_in, b)
+    #
+    # masked_inner_gru_state = get_inner_gru_state_with_mask(
+    #     input_n, shuffled_broadcastable_mask_n, hid_previous, attention_gate,
+    #     W_hid_stacked, W_in_stacked, b_stacked)
+    # print masked_inner_gru_state
+    # print masked_inner_gru_state.shape
 
-    # Test the modified GRU with a mask
-    get_episode_with_mask = test_masked_inner_gru_step(layer, fact, shuffled_broadcastable_mask,
-                                                       memory, gate, W_hid,
-                                                       W_in, b)
-    masked_episode = get_episode_with_mask(input_n, shuffled_broadcastable_mask_n, hid_previous,
-                                           attention_gate, W_hid_stacked,
-                                           W_in_stacked, b_stacked)
-    print masked_episode
-    print masked_episode.shape
-    # test_masked_inner_gru_step(layer, first_fact, mask, question, memory)
+    # Test
+    episodes = layer.get_output_for([facts])
+    fn = theano.function([facts], episodes)
+
+    np_episodes = fn(np_facts)
+    print np_episodes
+    print np_episodes.shape

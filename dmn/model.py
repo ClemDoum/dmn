@@ -1,5 +1,5 @@
-    from theano import tensor as T
-
+from theano import tensor as T
+from lasagne.layers.recurrent import GRULayer
 import theano
 from theano.gradient import np
 from theano.tensor.nnet import sigmoid

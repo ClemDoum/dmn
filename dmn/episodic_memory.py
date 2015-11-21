@@ -277,12 +277,14 @@ class EpisodicMemoryLayer(MergeLayer):
                  incoming,
                  num_units,
                  n_decodesteps,
+                 attention_mechanism='gru',
                  resetgate=Gate(W_cell=None),
                  updategate=Gate(W_cell=None),
                  hidden_update=Gate(W_cell=None,
                                     nonlinearity=nonlinearities.tanh),
                  hid_init=init.Constant(0.),
                  grad_clipping=False,
+                 gradient_steps=-1,
                  unroll_scan=False,
                  precompute_input=True,
                  mask_input=None,
@@ -299,6 +301,14 @@ class EpisodicMemoryLayer(MergeLayer):
         self.num_units = num_units
         self.grad_clipping = grad_clipping
         self.precompute_input = precompute_input
+        self.gradient_steps = gradient_steps
+
+        mechanisms = ['gru', 'softmax']
+        if attention_mechanism not in mechanisms:
+            raise ValueError("Invalid attention_mechanism.\n"
+                             "antention_mechanism must be in %s.\n"
+                             "Found %s." % (mechanisms, attention_mechanism))
+        self.attention_mechanism = attention_mechanism
 
         # Retrieve the dimensionality of the incoming layer
         input_shape = self.input_shapes[0]
@@ -338,6 +348,15 @@ class EpisodicMemoryLayer(MergeLayer):
     def slice_w(self, x, n):
         return x[:, n * self.num_units:(n + 1) * self.num_units]
 
+    def inner_gru_step(self, input_n, attention_gate, hid_previous,
+                       W_hid_stacked, W_in_stacked, b_stacked):
+        hid = self.gru_step(input_n, hid_previous, W_hid_stacked,
+                            W_in_stacked, b_stacked)
+        # return hid
+        # return attention_gate
+        hid = attention_gate * hid + (1 - attention_gate) * hid_previous
+        return hid
+
     def gru_step(self, input_n, hid_previous, W_hid_stacked, W_in_stacked,
                  b_stacked):
         # Compute W_{hr} h_{t - 1}, W_{hu} h_{t - 1}, and W_{hc} h_{t - 1}
@@ -372,127 +391,197 @@ class EpisodicMemoryLayer(MergeLayer):
         hid = (1 - updategate) * hid_previous + updategate * hidden_update
         return hid
 
-    def masked_gru_step(self, input_n, mask_n, hid_previous, W_hid_stacked,
-                        W_in_stacked, b_stacked):
+    def get_output_shape_for(self, input_shapes):
+        NotImplementedError
 
-        hid = self.gru_step(input_n, hid_previous, W_hid_stacked, W_in_stacked,
-                            b_stacked)
+    def get_output_for(self, inputs, **kwargs):
+        # Retrieve the layer input
+        input = inputs[0]
+        # Retrieve the mask when it is supplied
+        mask = inputs[1] if len(inputs) > 1 else None
 
-        # Skip over any input with mask 0 by copying the previous
-        # hidden state; proceed normally for any input with mask 1.
-        not_mask = 1 - mask_n
-        hid = hid * mask_n + hid_previous * not_mask
+        # Treat all dimensions after the second as flattened feature dimensions
+        if input.ndim > 3:
+            input = T.flatten(input, 3)
 
-        return hid
+        # Because scan iterates over the first dimension we dimshuffle to
+        # (n_time_steps, n_batch, n_features)
+        input = input.dimshuffle(1, 0, 2)
+        if mask:
+            mask.dimshuffle(1, 0)
+        seq_len, num_batch, _ = input.shape
 
-    def inner_gru_step(self, input_n, hid_previous, attention_gate,
-                       W_hid_stacked, W_in_stacked, b_stacked):
-        hid = self.gru_step(input_n, hid_previous, W_hid_stacked,
-                            W_in_stacked, b_stacked)
-        hid = attention_gate * hid + (1 - attention_gate) * hid_previous
-        return hid
+        # Stack input weight matrices into a (num_inputs, 3*num_units)
+        # matrix, which speeds up computation
+        W_in_stacked = T.concatenate(
+            [self.W_in_to_resetgate, self.W_in_to_updategate,
+             self.W_in_to_hidden_update], axis=1)
 
-    def masked_inner_gru_step(self, input_n, mask_n, hid_previous,
-                              attention_gate, W_hid_stacked, W_in_stacked,
-                              b_stacked):
-        hid = self.inner_gru_step(input_n, hid_previous, attention_gate,
-                                  W_hid_stacked, W_in_stacked, b_stacked)
-        # Skip over any input with mask 0 by copying the previous
-        # hidden state; proceed normally for any input with mask 1.
-        # return hid
-        not_mask = 1 - mask_n
-        hid = hid * mask_n + hid_previous * not_mask
-        return hid
+        # Same for hidden weight matrices
+        W_hid_stacked = T.concatenate(
+            [self.W_hid_to_resetgate, self.W_hid_to_updategate,
+             self.W_hid_to_hidden_update], axis=1)
 
-    def episode(self, attentions, facts, questions, Wf, Uf, bf, dim,
-                mask=None):
-        if self.softmax_attention:
-            NotImplementedError
-        else:
-            fact_dot_Wf_plus_bf = T.dot(facts, Wf) + bf
-            seqs = [attentions, fact_dot_Wf_plus_bf]
-            init_states = [questions]
-            non_seqs = [Uf, dim]
-            episodes, updates = theano.scan(compute_modified_gru_state,
+        # Stack gate biases into a (3*num_units) vector
+        b_stacked = T.concatenate(
+            [self.b_resetgate, self.b_updategate,
+             self.b_hidden_update], axis=0)
+
+        if self.precompute_input:
+            # precompute_input inputs*W. W_in is (n_features, 3*num_units).
+            # input is then (n_batch, n_time_steps, 3*num_units).
+            input = T.dot(input, W_in_stacked) + b_stacked
+
+        def masked_gru_step(input_n, mask_n, hid_previous, W_hid_stacked,
+                            W_in_stacked, b_stacked):
+
+            hid = self.gru_step(input_n, hid_previous, W_hid_stacked,
+                                W_in_stacked,
+                                b_stacked)
+
+            # Skip over any input with mask 0 by copying the previous
+            # hidden state; proceed normally for any input with mask 1.
+            not_mask = 1 - mask_n
+            hid = hid * mask_n + hid_previous * not_mask
+
+            return hid
+
+        def masked_inner_gru_step(input_n, mask_n, hid_previous,
+                                  attention_gate, W_hid_stacked, W_in_stacked,
+                                  b_stacked):
+            hid = self.inner_gru_step(input_n, hid_previous, attention_gate,
+                                      W_hid_stacked, W_in_stacked, b_stacked)
+            # Skip over any input with mask 0 by copying the previous
+            # hidden state; proceed normally for any input with mask 1.
+            # return hid
+            not_mask = 1 - mask_n
+            hid = hid * mask_n + hid_previous * not_mask
+            return hid
+
+        def episode(inputs, gates, initial_episode, W_hid_stacked,
+                    W_in_stacked, b_stacked, mask=None):
+            # Add a broadcastable dimension to gates (n_steps, batch_size)
+            # in order to perform the elementwise product with the hidden
+            # states of shape (n_steps, batch_size, hidden_dim)
+            gates = gates.dimshuffle(0, 'x')
+            if self.attention_mechanism == 'gru':
+                if mask is not None:
+                    sequences = [inputs, mask, gates]
+                    step_fun = masked_inner_gru_step
+                else:
+                    sequences = [inputs, gates]
+                    step_fun = self.inner_gru_step
+
+                # The hidden-to-hidden weight matrix is always used in step
+                non_seqs = [W_hid_stacked]
+                # When we aren't precomputing the input outside of scan, we need to
+                # provide the input weights and biases to the step function
+                if not self.precompute_input:
+                    non_seqs += [W_in_stacked, b_stacked]
+                # theano.scan only allows for positional arguments, so when
+                # self.precompute_input is True, we need to supply fake placeholder
+                # arguments for the input weights and biases.
+                else:
+                    non_seqs += [(), ()]
+
+                hid_out = theano.scan(
+                    fn=step_fun,
+                    sequences=sequences,
+                    # TODO: check if the GRU is reset to 0 at each pass
+                    outputs_info=[initial_episode],
+                    non_sequences=non_seqs,
+                    truncate_gradient=self.gradient_steps,
+                    strict=True)[0]
+                return hid_out
+                # return hid_out[-1]
+
+            elif self.attention_mechanism == 'softmax':
+                # TODO: implement softmax attention + gates supervision
+                return NotImplementedError
+            else:
+                raise ValueError(
+                    "Input sequence length cannot be specified as "
+                    "None when unroll_scan is True")
+
+        def attention_gate(inputs):
+            # Retrieve the layer input
+            fact = inputs[0]
+            memory = inputs[1]
+            question = inputs[2]
+
+            # Output must be of shape
+            # num_batches * dim * concatenation_length
+
+            # Compute z
+            to_concatenate = list()
+
+            def add_axis_and_extend(to_concatenate, tensor_list, last_dim=1):
+                for t in tensor_list:
+                    to_concatenate.append(t.reshape((t.shape[0], t.shape[1],
+                                                     last_dim)))
+
+            def reshape(t, last_dim=1):
+                return t.reshape((t.shape[0], t.shape[1], last_dim))
+
+            add_axis_and_extend(to_concatenate, [fact, memory, question])
+            add_axis_and_extend(to_concatenate,
+                                [fact * question, fact * memory])
+            add_axis_and_extend(to_concatenate,
+                                [T.abs_(fact - question),
+                                 T.abs_(fact - memory)])
+            to_concatenate.extend([T.dot(fact.T, T.dot(question, self.W_b)),
+                                   T.dot(fact.T, T.dot(memory, self.W_b))])
+
+            # return reshape(fact.T)
+            # return reshape(T.dot(question, self.W_b))
+            return T.dot(question, self.W_b)
+            return T.dot(reshape(fact.T), T.dot(question, self.W_b))
+
+            return concatenate(to_concatenate, axis=2)
+            print len(to_concatenate)
+            return concatenate(to_concatenate, axis=1)
+
+            z = concatenate(to_concatenate, axis=2)
+
+            # Compute the gates
+            gates = T.dot(T.tanh(T.dot(z, self.W_1) + self.b_1),
+                          self.W_2) + self.b_2
+            gates = T.nnet.sigmoid(gates)
+            return gates
+
+        def episodic_memory(facts, questions, nb_passes, params):
+            def compute_memory(f, q, m_1, U, W1, b1, W2, b2, Wb, Wf, Uf, bf,
+                               Wm,
+                               bm, dim):
+                # 1. Compute the attention from the fact, memory and question
+                a = self.attention_gates(f, q, m_1, W1, b1, W2, b2, Wb)
+                # 2. Compute the episode from the attention and the facts
+                e = self.episodes(a, f, q, Wf, Uf, bf, dim)
+                # 3. Compute the new memory from the episode
+                e_dot_Wm_plus_bm = T.dot(e, Wm) + bm
+                m = gru_step(e_dot_Wm_plus_bm, m_1, U, dim)
+                return m
+
+            seqs = [facts]
+            init_states = [T.alloc(questions)]  # Initialize it to the question
+            non_seqs = [questions, m_1]
+            params_keys = ['U', 'W1', 'b1', 'W2', 'b2', 'Wb', 'Wf', 'Uf', 'bf',
+                           'Wm',
+                           'bm', 'dim']
+            non_seqs = non_seqs + [params[k] for k in params_keys]
+
+            memories, updates = theano.scan(compute_memory,
                                             sequences=seqs,
                                             outputs_info=init_states,
                                             non_sequences=non_seqs,
                                             name="gru_layer",
+                                            n_steps=nb_passes,
                                             strict=True)
-            return episodes
+            return memories
 
-    def attention_gate(self, inputs):
-        # Retrieve the layer input
-        fact = inputs[0]
-        memory = inputs[1]
-        question = inputs[2]
-
-        # Output must be of shape
-        # num_batches * dim * concatenation_length
-
-        # Compute z
-        to_concatenate = list()
-
-        def add_axis_and_extend(to_concatenate, tensor_list, last_dim=1):
-            for t in tensor_list:
-                to_concatenate.append(t.reshape((t.shape[0], t.shape[1],
-                                                 last_dim)))
-
-        def reshape(t, last_dim=1):
-            return t.reshape((t.shape[0], t.shape[1], last_dim))
-
-        add_axis_and_extend(to_concatenate, [fact, memory, question])
-        add_axis_and_extend(to_concatenate,
-                            [fact * question, fact * memory])
-        add_axis_and_extend(to_concatenate,
-                            [T.abs_(fact - question),
-                             T.abs_(fact - memory)])
-        to_concatenate.extend([T.dot(fact.T, T.dot(question, self.W_b)),
-                               T.dot(fact.T, T.dot(memory, self.W_b))])
-
-        # return reshape(fact.T)
-        # return reshape(T.dot(question, self.W_b))
-        return T.dot(question, self.W_b)
-        return T.dot(reshape(fact.T), T.dot(question, self.W_b))
-
-        return concatenate(to_concatenate, axis=2)
-        print len(to_concatenate)
-        return concatenate(to_concatenate, axis=1)
-
-        z = concatenate(to_concatenate, axis=2)
-
-        # Compute the gates
-        gates = T.dot(T.tanh(T.dot(z, self.W_1) + self.b_1),
-                      self.W_2) + self.b_2
-        gates = T.nnet.sigmoid(gates)
-        return gates
-
-    def get_episodic_memory(self, facts, questions, nb_passes, params):
-        def compute_memory(f, q, m_1, U, W1, b1, W2, b2, Wb, Wf, Uf, bf,
-                           Wm,
-                           bm, dim):
-            # 1. Compute the attention from the fact, memory and question
-            a = self.attention_gates(f, q, m_1, W1, b1, W2, b2, Wb)
-            # 2. Compute the episode from the attention and the facts
-            e = self.episodes(a, f, q, Wf, Uf, bf, dim)
-            # 3. Compute the new memory from the episode
-            e_dot_Wm_plus_bm = T.dot(e, Wm) + bm
-            m = gru_step(e_dot_Wm_plus_bm, m_1, U, dim)
-            return m
-
-        seqs = [facts]
-        init_states = [T.alloc(questions)]  # Initialize it to the question
-        non_seqs = [questions, m_1]
-        params_keys = ['U', 'W1', 'b1', 'W2', 'b2', 'Wb', 'Wf', 'Uf', 'bf',
-                       'Wm',
-                       'bm', 'dim']
-        non_seqs = non_seqs + [params[k] for k in params_keys]
-
-        memories, updates = theano.scan(compute_memory,
-                                        sequences=seqs,
-                                        outputs_info=init_states,
-                                        non_sequences=non_seqs,
-                                        name="gru_layer",
-                                        n_steps=nb_passes,
-                                        strict=True)
-        return memories
+        gates = theano.shared(np.random.normal(size=(10, 1)).astype('float32'), broadcastable=(False, True))
+        initial_episode = theano.shared(np.ones((10, self.num_units))).astype(
+            "float32")
+        eps = episode(input, gates, initial_episode, W_hid_stacked,
+                      W_in_stacked, b_stacked, mask=mask)
+        return eps
