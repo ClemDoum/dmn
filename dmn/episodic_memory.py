@@ -303,6 +303,7 @@ class EpisodicMemoryLayer(MergeLayer):
 
         super(EpisodicMemoryLayer, self).__init__(incomings, **kwargs)
         self.num_units = num_units
+        self.n_decodesteps = n_decodesteps
         self.grad_clipping = grad_clipping
         self.precompute_input = precompute_input
         self.gradient_steps = gradient_steps
@@ -517,7 +518,6 @@ class EpisodicMemoryLayer(MergeLayer):
         if facts.ndim > 3:
             facts = T.flatten(facts, 3)
 
-
         # Because scan iterates over the first dimension we dimshuffle to
         # (n_time_steps, n_batch, n_features)
         facts = facts.dimshuffle(1, 0, 2)
@@ -577,7 +577,6 @@ class EpisodicMemoryLayer(MergeLayer):
 
             return hid
 
-
         def attention_gate(facts, memory, question):
             # TODO: for the first iteration question and memory are the same so
             # we can speedup the computation
@@ -609,18 +608,55 @@ class EpisodicMemoryLayer(MergeLayer):
             # TODO: to be continued for the moment just return ones
             return T.ones((facts.shape[1], facts.shape[0], 1))
 
-
         initial_episode = theano.shared(np.ones((10, self.num_units))).astype(
             "float32")
-        initial_mem = theano.shared(np.ones((10, self.num_units))).astype(
-            "float32")
 
-        gates = attention_gate(facts_for_gates, initial_mem, questions)
+        # Set the inial memory to the question
+        episodic_memory = questions.copy()  # is the copy necessary?
 
-        eps = self.episode(facts, gates, initial_episode, inner_W_hid_stacked,
-                           inner_W_in_stacked, inner_b_stacked, mask=mask)
+        def step(q, f, f_for_gates, e_m, i_W_hid_stacked, i_W_in_stacked,
+                 i_b_stacked, o_W_hid_stacked, o_W_in_stacked, o_b_stacked):
+            # 1. Compute the gates with the facts, the current memory and
+            #  the question
 
-        mem = self.episodic_memory(eps, initial_mem, outer_W_hid_stacked,
-                                   outer_W_in_stacked, outer_b_stacked, mask)
+            # We create a copy of e_m because it's modified by the attention
+            # computation
+            e_m_for_gates = e_m.copy()
+            gates = attention_gate(f_for_gates, e_m_for_gates, q)
 
-        return mem
+            # 2. Compute the episodes from the facts, the gates and
+            # the previous memory
+
+            # We create a copy of f because it's modified by episode
+            # computation
+            f_for_episodes = f.copy()
+            episodes = self.episode(f_for_episodes, gates, q, i_W_hid_stacked,
+                                    i_W_in_stacked, i_b_stacked)
+
+            # 3. Compute the new episodic memory from the new episode and
+            # the previous memory
+            mem = self.episodic_memory(episodes, e_m, o_W_hid_stacked,
+                                       o_W_in_stacked, o_b_stacked)
+            return mem
+
+        if self.precompute_input:
+            # We'll have to use both precomputed facts and facts_for_gates
+            non_seqs = [facts, facts_for_gates, questions]
+        else:
+            # We do not need to work with the facts_for_gates variable
+            non_seqs = [facts, facts, questions]
+
+        non_seqs += [inner_W_hid_stacked, inner_W_in_stacked, inner_b_stacked,
+                     outer_W_hid_stacked, outer_W_in_stacked, outer_b_stacked]
+
+        # Get a new episodic memory n_decodesteps times
+        outs, _ = theano.scan(
+            fn=step,
+            outputs_info=[episodic_memory],
+            non_sequences=non_seqs,
+            truncate_gradient=self.gradient_steps,
+            strict=True,
+            n_steps=self.n_decodesteps
+        )
+        # Keep only the last memory
+        return outs[-1]
