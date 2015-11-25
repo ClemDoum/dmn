@@ -444,6 +444,19 @@ class EpisodicMemoryLayer(MergeLayer):
         hid = (1 - updategate) * hid_previous + updategate * hidden_update
         return hid
 
+    def masked_gru_step(self, input_n, mask_n, hid_previous, W_hid_stacked,
+                        W_in_stacked, b_stacked):
+
+        hid = self.gru_step(input_n, hid_previous, W_hid_stacked, W_in_stacked,
+                            b_stacked)
+
+        # Skip over any input with mask 0 by copying the previous
+        # hidden state; proceed normally for any input with mask 1.
+        not_mask = 1 - mask_n
+        hid = hid * mask_n + hid_previous * not_mask
+
+        return hid
+
     def episode(self, inputs, gates, initial_episode, W_hid_stacked,
                 W_in_stacked, b_stacked, mask=None):
         # Add a broadcastable dimension to gates (n_steps, batch_size)
@@ -496,6 +509,37 @@ class EpisodicMemoryLayer(MergeLayer):
         mem = self.gru_step(episode_n, mem_previous, W_hid_stacked,
                             W_in_stacked, b_stacked, outer=True)
         return mem
+
+    def attention_gate(self, facts, memory, question):
+        # TODO: for the first iteration question and memory are the same so
+        # we can speedup the computation
+
+        # facts is (num_batch * fact_length * memory_dim)
+        # questions is (num_batch * memory_dim)
+        # memory is (num_batch * memory_dim)
+        # attention_gates must be (fact_length * nb_batch * 1)
+
+        # Compute z (num_batch * fact_length * (7*memory_dim + 2))
+
+        # Dimshuffle facts to get a shape of
+        # (fact_length * num_batch * memory_dim)
+        facts = facts.dimshuffle(1, 0, 2)
+
+        # Pad questions and memory to be of shape
+        # (_ * num_batch * memory_dim)
+        memory = T.shape_padleft(memory)
+        question = T.shape_padleft(question)
+
+        to_concatenate = list()
+        to_concatenate.extend([facts, memory, question])
+        to_concatenate.extend([facts * question, facts * memory])
+        to_concatenate.extend([T.abs_(facts - question),
+                               T.abs_(facts - memory)])
+
+        # z = concatenate(to_concatenate, axis=2)
+
+        # TODO: to be continued for the moment just return ones
+        return T.ones((facts.shape[1], facts.shape[0], 1))
 
     def get_output_shape_for(self, input_shapes):
         NotImplementedError
@@ -558,61 +602,22 @@ class EpisodicMemoryLayer(MergeLayer):
         # Define facts for gates as we may change the facts shape
         # to precompute the input of the GRU
         facts_for_gates = facts
+
         if self.precompute_input:
             # precompute_input inputs*W. W_in is (n_features, 3*num_units).
             # input is then (n_batch, n_time_steps, 3*num_units).
             facts = T.dot(facts, inner_W_in_stacked) + inner_b_stacked
-
-        def masked_gru_step(input_n, mask_n, hid_previous, W_hid_stacked,
-                            W_in_stacked, b_stacked):
-
-            hid = self.gru_step(input_n, hid_previous, W_hid_stacked,
-                                W_in_stacked,
-                                b_stacked)
-
-            # Skip over any input with mask 0 by copying the previous
-            # hidden state; proceed normally for any input with mask 1.
-            not_mask = 1 - mask_n
-            hid = hid * mask_n + hid_previous * not_mask
-
-            return hid
-
-        def attention_gate(facts, memory, question):
-            # TODO: for the first iteration question and memory are the same so
-            # we can speedup the computation
-
-            # facts is (num_batch * fact_length * memory_dim)
-            # questions is (num_batch * memory_dim)
-            # memory is (num_batch * memory_dim)
-            # attention_gates must be (fact_length * nb_batch * 1)
-
-            # Compute z (num_batch * fact_length * (7*memory_dim + 2))
-
-            # Dimshuffle facts to get a shape of
-            # (fact_length * num_batch * memory_dim)
-            facts = facts.dimshuffle(1, 0, 2)
-
-            # Pad questions and memory to be of shape
-            # (_ * num_batch * memory_dim)
-            memory = T.shape_padleft(memory)
-            question = T.shape_padleft(question)
-
-            to_concatenate = list()
-            to_concatenate.extend([facts, memory, question])
-            to_concatenate.extend([facts * question, facts * memory])
-            to_concatenate.extend([T.abs_(facts - question),
-                                   T.abs_(facts - memory)])
-
-            # z = concatenate(to_concatenate, axis=2)
-
-            # TODO: to be continued for the moment just return ones
-            return T.ones((facts.shape[1], facts.shape[0], 1))
-
-        initial_episode = theano.shared(np.ones((10, self.num_units))).astype(
-            "float32")
+            # We'll have to use both precomputed facts and facts_for_gates
+            non_seqs = [facts, facts_for_gates, questions]
+        else:
+            # We do not need to work with the facts_for_gates variable
+            non_seqs = [facts, facts, questions]
 
         # Set the inial memory to the question
         episodic_memory = questions.copy()  # is the copy necessary?
+
+        non_seqs += [inner_W_hid_stacked, inner_W_in_stacked, inner_b_stacked,
+                     outer_W_hid_stacked, outer_W_in_stacked, outer_b_stacked]
 
         def step(q, f, f_for_gates, e_m, i_W_hid_stacked, i_W_in_stacked,
                  i_b_stacked, o_W_hid_stacked, o_W_in_stacked, o_b_stacked):
@@ -622,7 +627,7 @@ class EpisodicMemoryLayer(MergeLayer):
             # We create a copy of e_m because it's modified by the attention
             # computation
             e_m_for_gates = e_m.copy()
-            gates = attention_gate(f_for_gates, e_m_for_gates, q)
+            gates = self.attention_gate(f_for_gates, e_m_for_gates, q)
 
             # 2. Compute the episodes from the facts, the gates and
             # the previous memory
@@ -638,16 +643,6 @@ class EpisodicMemoryLayer(MergeLayer):
             mem = self.episodic_memory(episodes, e_m, o_W_hid_stacked,
                                        o_W_in_stacked, o_b_stacked)
             return mem
-
-        if self.precompute_input:
-            # We'll have to use both precomputed facts and facts_for_gates
-            non_seqs = [facts, facts_for_gates, questions]
-        else:
-            # We do not need to work with the facts_for_gates variable
-            non_seqs = [facts, facts, questions]
-
-        non_seqs += [inner_W_hid_stacked, inner_W_in_stacked, inner_b_stacked,
-                     outer_W_hid_stacked, outer_W_in_stacked, outer_b_stacked]
 
         # Get a new episodic memory n_decodesteps times
         outs, _ = theano.scan(
