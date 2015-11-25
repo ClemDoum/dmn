@@ -615,10 +615,7 @@ class EpisodicMemoryLayer(MergeLayer):
         initial_mem = theano.shared(np.ones((10, self.num_units))).astype(
             "float32")
 
-        fact = facts[0]
-        question = questions[0]
-
-        gates = attention_gate(facts_for_gates, initial_mem, question)
+        gates = attention_gate(facts_for_gates, initial_mem, questions)
 
         eps = self.episode(facts, gates, initial_episode, inner_W_hid_stacked,
                            inner_W_in_stacked, inner_b_stacked, mask=mask)
