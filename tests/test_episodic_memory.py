@@ -1,9 +1,10 @@
+from lasagne.layers.recurrent import GRULayer
 import numpy as np
 import theano
 import theano.tensor as T
 from lasagne.layers import InputLayer
 
-from dmn.episodic_memory import EpisodicMemoryLayer
+from dmn.episodic_memory import EpisodicMemoryLayer, concatenate
 
 
 # theano.config.exception_verbosity = 'high'
@@ -71,7 +72,7 @@ if __name__ == '__main__':
     fact = T.matrix("fact", dtype=floatX)
     facts = T.tensor3("facts", dtype=floatX)
     masks = T.matrix("masks", dtype=intX)
-    question = T.matrix(name="question", dtype=floatX)
+    questions = T.matrix(name="question", dtype=floatX)
     memory = T.matrix("memory", dtype=floatX)
     gate = T.matrix("gate", dtype=floatX)
     mask = T.vector("mask", dtype=intX)
@@ -107,6 +108,11 @@ if __name__ == '__main__':
     W_in_stacked = np.random.normal(
         size=(representation_dim, 3 * representation_dim)).astype(floatX)
     b_stacked = np.random.normal(size=(3 * representation_dim,)).astype(floatX)
+    np_questions = np.random.normal(
+        size=(batch_size, representation_dim)).astype(floatX)
+    np_memory = np.random.normal(
+        size=(batch_size, representation_dim)).astype(floatX)
+
 
     # # Compute the gates
     # fn = gating_function(layer, first_fact, question, memory, representation_dim)
@@ -135,12 +141,11 @@ if __name__ == '__main__':
     # print masked_inner_gru_state
     # print masked_inner_gru_state.shape
 
-    # Test
-    episodic_mem = layer.get_output_for([facts])
-    fn = theano.function([facts], episodic_mem, #mode='DebugMode',
-                         on_unused_input='ignore'
-                         )
+    # # Test
+    episodic_mem = layer.get_output_for([facts, questions])
+    fn = theano.function([facts, questions], episodic_mem,  # mode='DebugMode',
+                         on_unused_input='ignore')
 
-    np_episodic_mem = fn(np_facts)
+    np_episodic_mem = fn(np_facts, np_questions)
     print np_episodic_mem
     print np_episodic_mem.shape

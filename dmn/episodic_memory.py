@@ -448,7 +448,9 @@ class EpisodicMemoryLayer(MergeLayer):
         # Add a broadcastable dimension to gates (n_steps, batch_size)
         # in order to perform the elementwise product with the hidden
         # states of shape (n_steps, batch_size, hidden_dim)
-        gates = gates.dimshuffle(0, 'x')
+
+        # gates = gates.dimshuffle(0, 'x')
+
 
         if self.attention_mechanism == 'gru':
             if mask is not None:
@@ -498,21 +500,30 @@ class EpisodicMemoryLayer(MergeLayer):
         NotImplementedError
 
     def get_output_for(self, inputs, **kwargs):
-        # Retrieve the layer input
-        input = inputs[0]
-        # Retrieve the mask when it is supplied
-        mask = inputs[1] if len(inputs) > 1 else None
+        # Retrieve the facts
+        facts = inputs[0]
+
+        # return facts
+
+        # Retrieve the mask when it is supplied and the questions
+        if len(inputs) > 2:
+            mask = inputs[1]
+            questions = inputs[2]
+        else:
+            mask = None
+            questions = inputs[1]
 
         # Treat all dimensions after the second as flattened feature dimensions
-        if input.ndim > 3:
-            input = T.flatten(input, 3)
+        if facts.ndim > 3:
+            facts = T.flatten(facts, 3)
+
 
         # Because scan iterates over the first dimension we dimshuffle to
         # (n_time_steps, n_batch, n_features)
-        input = input.dimshuffle(1, 0, 2)
+        facts = facts.dimshuffle(1, 0, 2)
         if mask:
             mask.dimshuffle(1, 0)
-        seq_len, num_batch, _ = input.shape
+        seq_len, num_batch, _ = facts.shape
 
         # Stack input weight matrices into a (num_inputs, 3*num_units)
         # matrix, which speeds up computation
@@ -544,10 +555,13 @@ class EpisodicMemoryLayer(MergeLayer):
             [self.outer_b_resetgate, self.outer_b_updategate,
              self.outer_b_hidden_update], axis=0)
 
+        # Define facts for gates as we may change the facts shape
+        # to precompute the input of the GRU
+        facts_for_gates = facts
         if self.precompute_input:
             # precompute_input inputs*W. W_in is (n_features, 3*num_units).
             # input is then (n_batch, n_time_steps, 3*num_units).
-            input = T.dot(input, inner_W_in_stacked) + inner_b_stacked
+            facts = T.dot(facts, inner_W_in_stacked) + inner_b_stacked
 
         def masked_gru_step(input_n, mask_n, hid_previous, W_hid_stacked,
                             W_in_stacked, b_stacked):
@@ -563,89 +577,53 @@ class EpisodicMemoryLayer(MergeLayer):
 
             return hid
 
-        def attention_gate(inputs):
-            # Retrieve the layer input
-            fact = inputs[0]
-            memory = inputs[1]
-            question = inputs[2]
 
-            # Output must be of shape
-            # num_batches * dim * concatenation_length
+        def attention_gate(facts, memory, question):
+            # TODO: for the first iteration question and memory are the same so
+            # we can speedup the computation
 
-            # Compute z
+            # facts is (num_batch * fact_length * memory_dim)
+            # questions is (num_batch * memory_dim)
+            # memory is (num_batch * memory_dim)
+            # attention_gates must be (fact_length * nb_batch * 1)
+
+            # Compute z (num_batch * fact_length * (7*memory_dim + 2))
+
+            # Dimshuffle facts to get a shape of
+            # (fact_length * num_batch * memory_dim)
+            facts = facts.dimshuffle(1, 0, 2)
+
+            # Pad questions and memory to be of shape
+            # (_ * num_batch * memory_dim)
+            memory = T.shape_padleft(memory)
+            question = T.shape_padleft(question)
+
             to_concatenate = list()
+            to_concatenate.extend([facts, memory, question])
+            to_concatenate.extend([facts * question, facts * memory])
+            to_concatenate.extend([T.abs_(facts - question),
+                                   T.abs_(facts - memory)])
 
-            def add_axis_and_extend(to_concatenate, tensor_list, last_dim=1):
-                for t in tensor_list:
-                    to_concatenate.append(t.reshape((t.shape[0], t.shape[1],
-                                                     last_dim)))
+            # z = concatenate(to_concatenate, axis=2)
 
-            def reshape(t, last_dim=1):
-                return t.reshape((t.shape[0], t.shape[1], last_dim))
+            # TODO: to be continued for the moment just return ones
+            return T.ones((facts.shape[1], facts.shape[0], 1))
 
-            add_axis_and_extend(to_concatenate, [fact, memory, question])
-            add_axis_and_extend(to_concatenate,
-                                [fact * question, fact * memory])
-            add_axis_and_extend(to_concatenate,
-                                [T.abs_(fact - question),
-                                 T.abs_(fact - memory)])
-            to_concatenate.extend([T.dot(fact.T, T.dot(question, self.W_b)),
-                                   T.dot(fact.T, T.dot(memory, self.W_b))])
 
-            # return reshape(fact.T)
-            # return reshape(T.dot(question, self.W_b))
-            return T.dot(question, self.W_b)
-            return T.dot(reshape(fact.T), T.dot(question, self.W_b))
-
-            return concatenate(to_concatenate, axis=2)
-            print len(to_concatenate)
-            return concatenate(to_concatenate, axis=1)
-
-            z = concatenate(to_concatenate, axis=2)
-
-            # Compute the gates
-            gates = T.dot(T.tanh(T.dot(z, self.W_1) + self.b_1),
-                          self.W_2) + self.b_2
-            gates = T.nnet.sigmoid(gates)
-            return gates
-
-            def compute_memory(f, q, m_1, U, W1, b1, W2, b2, Wb, Wf, Uf, bf,
-                               Wm,
-                               bm, dim):
-                # 1. Compute the attention from the fact, memory and question
-                a = self.attention_gates(f, q, m_1, W1, b1, W2, b2, Wb)
-                # 2. Compute the episode from the attention and the facts
-                e = self.episodes(a, f, q, Wf, Uf, bf, dim)
-                # 3. Compute the new memory from the episode
-                e_dot_Wm_plus_bm = T.dot(e, Wm) + bm
-                m = gru_step(e_dot_Wm_plus_bm, m_1, U, dim)
-                return m
-
-            seqs = [facts]
-            init_states = [T.alloc(questions)]  # Initialize it to the question
-            non_seqs = [questions, m_1]
-            params_keys = ['U', 'W1', 'b1', 'W2', 'b2', 'Wb', 'Wf', 'Uf', 'bf',
-                           'Wm',
-                           'bm', 'dim']
-            non_seqs = non_seqs + [params[k] for k in params_keys]
-
-            memories, updates = theano.scan(compute_memory,
-                                            sequences=seqs,
-                                            outputs_info=init_states,
-                                            non_sequences=non_seqs,
-                                            name="gru_layer",
-                                            n_steps=nb_passes,
-                                            strict=True)
-            return memories
-
-        gates = theano.shared(np.random.normal(size=(10, 1)).astype('float32'),
-                              broadcastable=(False, True))
         initial_episode = theano.shared(np.ones((10, self.num_units))).astype(
             "float32")
         initial_mem = theano.shared(np.ones((10, self.num_units))).astype(
             "float32")
-        eps = self.episode(input, gates, initial_episode, inner_W_hid_stacked,
+
+        fact = facts[0]
+        question = questions[0]
+
+        gates = attention_gate(facts_for_gates, initial_mem, question)
+
+        eps = self.episode(facts, gates, initial_episode, inner_W_hid_stacked,
                            inner_W_in_stacked, inner_b_stacked, mask=mask)
+
         mem = self.episodic_memory(eps, initial_mem, outer_W_hid_stacked,
                                    outer_W_in_stacked, outer_b_stacked, mask)
+
         return mem
