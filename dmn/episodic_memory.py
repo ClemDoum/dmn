@@ -5,6 +5,9 @@ from lasagne.layers import MergeLayer, Gate
 from theano.gradient import np
 
 
+# concatenate funciton from Kyunghyun Cho
+# https://github.com/kyunghyuncho/dl4mt-material
+
 def concatenate(tensor_list, axis=0):
     """
     Alternative implementation of `theano.tensor.concatenate`.
@@ -48,118 +51,6 @@ def concatenate(tensor_list, axis=0):
         offset += tt.shape[axis]
 
     return out
-
-
-class GatingLayer(object):
-    def __init__(self,
-                 incoming,
-                 representation_dim,
-                 mask_input=None,
-                 learn_init=True,
-                 gradient_steps=-1,
-                 **kwargs):
-        # This layer inherits from a MergeLayer, because it can have two
-        # inputs - the layer input, and the mask.  We will just provide the
-        # layer input as incomings, unless a mask input was provided.
-        incomings = [incoming]
-        if mask_input is not None:
-            incomings.append(mask_input)
-
-        self.representation_dim = representation_dim
-        self.W_b = theano.shared(
-            init.Normal(0.1).sample((representation_dim, representation_dim)),
-            name="W_b")
-        self.W_1 = theano.shared(
-            init.Normal(0.1).sample((representation_dim, representation_dim)),
-            name="W_1")
-        self.W_2 = theano.shared(
-            init.Normal(0.1).sample((representation_dim, representation_dim)),
-            name="W_2")
-        self.b_1 = theano.shared(
-            init.Constant(0.).sample((representation_dim,)), name="b_1")
-        self.b_2 = theano.shared(
-            init.Constant(0.).sample(representation_dim, ), name="b_2")
-
-    def get_output_shape_for(self, input_shapes):
-        # The shape of the input to this layer will be the first element
-        # of input_shapes, whether or not a mask input is being used.
-        input_shape = input_shapes[0]
-        return input_shape[0], input_shape[1], self.re
-
-    def get_output_for(self, inputs):
-        # Retrieve the layer input
-        fact = inputs[0]
-        memory = inputs[1]
-        question = inputs[2]
-
-        # Output must be of shape
-        # num_batches * dim * concatenation_length
-
-        # Compute z
-        to_concatenate = list()
-
-        def add_axis_and_extend(to_concatenate, tensor_list, last_dim=1):
-            for t in tensor_list:
-                to_concatenate.append(t.reshape((t.shape[0], t.shape[1],
-                                                 last_dim)))
-
-        def reshape(t, last_dim=1):
-            return t.reshape((t.shape[0], t.shape[1], last_dim))
-
-        add_axis_and_extend(to_concatenate, [fact, memory, question])
-        add_axis_and_extend(to_concatenate, [fact * question, fact * memory])
-        add_axis_and_extend(to_concatenate,
-                            [T.abs_(fact - question), T.abs_(fact - memory)])
-        to_concatenate.extend([T.dot(fact.T, T.dot(question, self.W_b)),
-                               T.dot(fact.T, T.dot(memory, self.W_b))])
-
-        # return reshape(fact.T)
-        # return reshape(T.dot(question, self.W_b))
-        return T.dot(question, self.W_b)
-        return T.dot(reshape(fact.T), T.dot(question, self.W_b))
-
-        return concatenate(to_concatenate, axis=2)
-        print len(to_concatenate)
-        return concatenate(to_concatenate, axis=1)
-
-        z = concatenate(to_concatenate, axis=2)
-
-        # Compute the gates
-        gates = T.dot(T.tanh(T.dot(z, self.W_1) + self.b_1),
-                      self.W_2) + self.b_2
-        gates = T.nnet.sigmoid(gates)
-        return gates
-
-
-class ModifiedGruLayer(object):
-    def __init__(self,
-                 incoming,
-                 representation_dim,
-                 mask_input=None,
-                 learn_init=True,
-                 gradient_steps=-1,
-                 **kwargs):
-        # This layer inherits from a MergeLayer, because it can have two
-        # inputs - the layer input, and the mask.  We will just provide the
-        # layer input as incomings, unless a mask input was provided.
-        incomings = [incoming]
-        if mask_input is not None:
-            incomings.append(mask_input)
-
-        self.representation_dim = representation_dim
-        self.W_b = theano.shared(
-            init.Normal(0.1).sample((representation_dim, representation_dim)),
-            name="W_b")
-        self.W_1 = theano.shared(
-            init.Normal(0.1).sample((representation_dim, representation_dim)),
-            name="W_1")
-        self.W_2 = theano.shared(
-            init.Normal(0.1).sample((representation_dim, representation_dim)),
-            name="W_2")
-        self.b_1 = theano.shared(
-            init.Constant(0.).sample((representation_dim,)), name="b_1")
-        self.b_2 = theano.shared(
-            init.Constant(0.).sample(representation_dim, ), name="b_2")
 
 
 class EpisodicMemoryLayer(MergeLayer):
